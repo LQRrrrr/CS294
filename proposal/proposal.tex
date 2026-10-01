@@ -1,0 +1,290 @@
+\documentclass[11pt,letterpaper]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{fontspec}
+\setmainfont{texgyrepagella-regular.otf}[BoldFont=texgyrepagella-bold.otf,ItalicFont=texgyrepagella-italic.otf,BoldItalicFont=texgyrepagella-bolditalic.otf]
+\setsansfont{texgyreheros-regular.otf}[BoldFont=texgyreheros-bold.otf,ItalicFont=texgyreheros-italic.otf]
+\setmonofont{lmmono10-regular.otf}[Scale=0.88]
+\usepackage{amsmath,amssymb,booktabs,tabularx,array,enumitem,xcolor}
+\usepackage{hyperref,fancyhdr,microtype}
+\definecolor{navy}{HTML}{17365D}
+\hypersetup{colorlinks=true,linkcolor=navy,urlcolor=navy,citecolor=navy,pdftitle={Foundation Models for News-Conditioned Intraday Return Forecasting}}
+\urlstyle{same}
+\setlist{nosep,leftmargin=*}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\setlength{\emergencystretch}{2em}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\sffamily CS294 / Prediction task proposal}
+\fancyhead[R]{\small\sffamily September 30, 2026}
+\fancyfoot[C]{\small\thepage}
+\setlength{\headheight}{14pt}
+\renewcommand{\topfraction}{0.95}
+\renewcommand{\textfraction}{0.05}
+\renewcommand{\floatpagefraction}{0.85}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\CRPS}{\operatorname{CRPS}}
+\newcommand{\MSE}{\operatorname{MSE}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\begin{document}
+\begin{center}
+{\Large\sffamily\bfseries\color{navy} Can Foundation Models Forecast\par News-Conditioned Intraday Stock Returns?}\par
+\vspace{5pt}
+{\large A leakage-controlled prediction task using RavenPack and TAQ}\par
+\vspace{4pt}
+CS294 assignment proposal \quad | \quad September 30, 2026
+\end{center}
+
+\begin{abstract}
+This project tests whether pretrained tabular and time-series foundation models improve probabilistic forecasts of the next three 15-minute stock returns after company news. The data design comes from Qiuran Lyu's 2023 undergraduate thesis, which joins RavenPack news analytics to TAQ intraday quotes. I compare TabPFN/TabPFN-TS with Chronos, TimesFM, Moirai, and additional sequence-model alternatives under chronological, purged evaluation. The primary score is a proper quantile score, with CRPS as its distributional counterpart and mean squared error as a secondary measure. A derivation distinguishes the unknowable real-data Bayes optimum from a retrospective feature-cell optimum and a trivial outcome-lookup oracle. A runnable reference implementation validates the scoring and oracle comparison on synthetic data; no proprietary-data or foundation-model performance is claimed.
+\end{abstract}
+
+\textbf{Status and scope.} The supplied files contain the assignment and the thesis PDF, but no RavenPack SAS files, TAQ quote files, or security mapping. Thus this is a research proposal with a completed scoring demonstration, \emph{not} a completed empirical submission on the thesis data. The real-data experiment requires licensed data access. Model capabilities below were checked against official repositories/model cards on September 30, 2026; general benchmark rankings are not evidence of financial predictability.
+
+\section{Data source: what the supplied thesis actually describes}
+The thesis, \emph{The Impact of Company News on Stock Returns: Evidence from RavenPack News and TAQ High-Frequency Trading Data}, was completed in 2023 \cite{thesis}. It studies U.S. stocks, not a Chinese-market price dataset. The relevant evidence is in Sections 1.3 and 2--3, Tables 1--3, and Tables 6--8. Page references below use \emph{printed thesis pages}; PDF pages are six pages later.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}P{0.20\linewidth}Y@{}}
+\toprule
+Component & Verified description and consequence for this project \\
+\midrule
+RavenPack & Company/entity-level, timestamped news analytics. Annual files have tens of millions of rows and 48 columns; the thesis reads SAS files in million-row chunks (p.~6). This is structured news metadata/sentiment, not a supplied corpus of full article text. \\
+TAQ extract & The described extract covers 23,052 stocks in 1993--2020, sampled every 15 minutes in the 09:30--16:00 U.S. session. Listed columns are date, time, and minimum/median/maximum bid and ask prices (p.~6). Volume or trade-direction fields are not established for this extract. \\
+Entity join & A RavenPack--CRSP mapping connects \texttt{RP\_ENTITY\_ID} to \texttt{PERMNO}; 12,770 mapped firms remain across the broader study (p.~6). Validate the mapping's effective dates rather than assume tickers are stable. \\
+Actual pilot & The thesis focuses on 2010, reports 919,360 matched news--return observations (p.~8), and splits data chronologically 60/20/20 (p.~10). These are event-linked observations, not the full regularly sampled stock panel. \\
+Coverage & The intended news/quote overlap is 2004--2020. The 2010 stock count is inconsistent: 5,757 in Section 1.3 versus 5,809 in Table 1. Do not silently choose either as the cleaned sample size. \\
+\bottomrule
+\end{tabularx}
+\caption{Data inventory reconstructed from the supplied thesis, not from raw files.}
+\end{table}
+
+\textbf{Numerical news features.} Table 3 (p.~9) lists \emph{20}, although the introduction says 19: \texttt{Relevance}, \texttt{ESS}, \texttt{News\_Count}, \texttt{News\_Count\_Positive}, \texttt{ENS}, \texttt{Similarity}, \texttt{Novelty}, \texttt{Global\_Novelty}, \texttt{Entity\_Index}, \texttt{Entity\_Count}, \texttt{Comp\_Senti\_Score}, \texttt{NIP\_market}, \texttt{PEQ}, \texttt{BEE}, \texttt{BMQ}, \texttt{BAM}, \texttt{BCA}, \texttt{BER}, \texttt{ANL\_CHG}, and \texttt{MCQ}. These represent relevance, sentiment, rolling news activity, novelty/similarity, entity mentions, and specialized sentiment channels. The thesis also describes \texttt{NEWS\_TYPE}, \texttt{CATEGORY}, and \texttt{TOPIC}; some rare categorical values were excluded from its predictive models. The mapping from these renamed variables to raw vendor fields must be documented; identifiers are not numerical predictors.
+
+\textbf{Important audit items.} The thesis reports extreme simple returns, including a maximum \texttt{Within\_Return} of 880.319 and a maximum \texttt{III\_Return} of 115.507 (Table 3). These call for quote-quality, unit, corporate-action, and near-zero-denominator checks before statistical interpretation. Its ``EST'' conversion must be replaced with the daylight-saving-aware \texttt{America/New\_York} timezone. The stated 26 intraday slots also requires checking whether timestamps label interval starts or ends; do not invent a 27th observation or an opening quote. The PDF is documentation, not an extractable replacement for the underlying observations.
+
+\textbf{Access plan.} Obtain institutionally authorized RavenPack News Analytics \cite{ravenpack} and NYSE TAQ/WRDS access \cite{taq}, the original aggregation code if available, and the dated security mapping. Keep licensed records and model inference local. A public daily-price substitute would be a separate lower-frequency experiment: it cannot reproduce the thesis's 2010 intraday/news task.
+
+\section{Prediction outcomes, information set, and construction}
+\subsection{Primary outcome: future interval returns, not concurrent reactions}
+Construct one record per security and completed 15-minute bar with at least one company-news arrival. Let $t$ be the bar \emph{endpoint} and forecast origin. Aggregate only news received by $t$; use only quote observations available by $t$. With positive, valid endpoint prices $P_{i,t}$, define
+\begin{equation}
+Y_{i,t,h}=\frac{P_{i,t+h}}{P_{i,t+h-1}}-1,\qquad h\in\{1,2,3\}.
+\label{eq:target}
+\end{equation}
+Each step is 15 minutes. These are the next interval's return and the second and third future interval returns, corresponding to the thesis's I/II/III idea. $Y_{i,t,3}$ is \emph{not} the cumulative 45-minute return. A cumulative auxiliary target may be $P_{i,t+h}/P_{i,t}-1$, but receives a separate results table. The concurrent \texttt{Within\_Return} is not a primary target: a whole-bar news summary may contain information arriving after that return began.
+
+\textbf{Price convention.} For the new experiment, use the midpoint of valid endpoint bid and ask quotes, $P=(B+A)/2$, if endpoint quotes can be obtained. If only the thesis's within-bar median bid/ask extract exists, predeclare its median-midquote construction and availability at the completed bar; do not describe it as an endpoint quote or assume it exactly reproduces the thesis's unspecified price choice. Never mix price conventions across models. Quarantine invalid/crossed quotes and adjusted-price discontinuities using outcome-independent, preregistered rules; report retention counts.
+
+\textbf{Session rules.} Initially retain only intraday origins for which all three future bars exist in the same regular session. Exclude after-hours news, opening-gap targets, holidays, and unmatched rows from this first trial, with counts. Extensions may treat overnight news and returns explicitly. Build the regular trading-bar panel \emph{before} selecting news origins; consecutive news events are not consecutive 15-minute observations. Drop duplicate vendor story/entity records according to a fixed key, then aggregate multiple distinct news arrivals into one security--origin record. This avoids scoring the same return repeatedly merely because it attracted more stories.
+
+\subsection{Relevant features, available at forecast time}
+\begin{enumerate}
+\item \textbf{Price history:} the preceding 26, 130, or 520 observed trading-bar returns; trailing volatility over 4/26/130 bars; lagged spread if endpoint bid/ask data supports it; missingness and session-boundary indicators. Use one scale estimated on training data only. No filled future returns enter a context.
+\item \textbf{Current/past news:} Table 3's numerical attributes aggregated by mean, maximum, and count, plus relevance-weighted sentiment; arrival counts and time since the last arrival. Positive-news percentages are not raw counts. Preserve missingness rather than replacing unavailable specialized sentiment with a genuine neutral score of 50.
+\item \textbf{Calendar and security context:} time-of-day, weekday, and session masks; security identifier as an optional tabular category, not an ordinal magnitude. Categories are encoded using training data with an unseen-category bucket. Calendar variables are known in the future; future news is not.
+\end{enumerate}
+Run two clearly labeled tracks: \textbf{A, return-history only}, shared by all sequence models; and \textbf{B, return-history plus observed news}, using covariate-capable models or a direct tabular adaptation. This separates the benefit of pretraining from the benefit of access to additional information. A history-only model losing to a news-aware model does not by itself identify a superior architecture. The financial question is predictive association, not a causal effect of news.
+
+\section{Foundation-model search and recommended shortlist}
+Here ``foundation model'' means a pretrained model intended to transfer across datasets, not a newly trained LSTM/Transformer or a generic text LLM prompted with prices. Official implementations establish that the following candidates exist; their suitability is a hypothesis to test.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\begin{tabularx}{\linewidth}{@{}P{0.17\linewidth}P{0.28\linewidth}Y@{}}
+\toprule
+Family / source & Verified mechanism and outputs & Fit to this task and caveat \\
+\midrule
+TabPFN / TabPFN-TS \cite{tabpfn} & Tabular regression from a context table; time-series wrapper supplies temporal features and point/quantile predictions. Current v1.3.0 defaults to TabPFN-3.5. & Direct TabPFN regression can consume observed news and lags. The TS wrapper uses known-future dynamic covariates but drops past-only and static covariates; these are \emph{different} adaptations. \\
+Chronos / Bolt / 2 \cite{chronos} & Original Chronos generates samples from quantized series; Bolt produces direct quantiles; Chronos-2 adds multivariate and covariate forecasting. & Chronos-2 is a priority news-aware comparator. Bolt-small (48M) is a lighter history-only alternative. Do not ascribe Chronos-2 covariate support to every older checkpoint. \\
+TimesFM \cite{timesfm} & Pretrained patch-based forecasting. Current 3.0 has native multivariate and past-only/past-and-future covariates; older 2.5 uses an XReg covariate path. & Priority news-aware comparator, contingent on memory. Local 3.0 weights are non-commercial/non-production; 2.5 weights remain Apache-2.0. \\
+Moirai / Moirai-2 \cite{moirai} & Universal multivariate forecasting; 1.x uses distributional predictions; 2.0 uses quantile loss. Forecast adapters expose past/future dynamic covariates. & Priority news-aware comparator. Pin \texttt{Salesforce/moirai-2.0-R-small}; its card specifies CC-BY-NC-4.0. A code license is not the weight license. \\
+Sundial \cite{sundial} & Generative continuous-valued series forecasting with TimeFlow; sampled trajectories give means/quantiles. & Useful probabilistic history-only comparator. Use \texttt{thuml/sundial-base-128m}; no unverified native news-covariate claim. Review/pin remote model code. \\
+Timer / Timer-XL \cite{timer} & Timer is pretrained autoregressive patch prediction; Timer-XL provides long-context, multidimensional forecasting. & Optional transfer/fine-tuning comparator. Quantile output and zero-shot behavior must be checked for the exact checkpoint; not all Timer-XL training configurations are pretrained zero-shot models. \\
+Time-MoE \cite{timemoe} & Sparse mixture-of-experts forecasting; released 50M/200M checkpoints; contexts up to 4,096. & Optional history-only point baseline. Official TODO still lists covariate support; do not pass unsupported news inputs or call point output a distribution. \\
+MOMENT \cite{moment} & Masked-reconstruction pretraining for several time-series tasks; forecasting supports a task head/linear probing. & Optional pretrained-representation comparator, evaluated as head training/fine-tuning, not an assumed ready-made zero-shot probabilistic forecaster. \\
+\bottomrule
+\end{tabularx}
+\caption{Eight model families checked against primary sources. Versions and interfaces matter.}
+\label{tab:models}
+\end{table}
+
+\textbf{Minimal experiment.} Start with direct TabPFN, TabPFN-TS, Chronos-2, and Moirai-2; add TimesFM-3.0 if resources permit. Include Chronos-Bolt-small when inference cost is binding. TabPFN-TS is the requested bridge from tabular pretraining to sequences, but direct TabPFN is the more natural route for the thesis's observed event attributes. Treat Sundial, Timer, Time-MoE, and MOMENT as extensions rather than require eight large environments before the first useful result.
+
+\textbf{Baselines and deployment constraints.} Compare against zero-return forecasts, training-only empirical return distributions, regularized linear regression, gradient-boosted trees, and a small MLP; these are \emph{not} foundation models. Forecast zero as the mean, not as the only plausible distribution. Use local TabPFN mode because hosted inference could transmit licensed data; disable optional telemetry. Use isolated Python environments because requirements differ (MOMENT recommends Python 3.11); pin code revision, package versions, checkpoint revision, license, seed, and device. The supplied scoring script needs only Python's standard library; it does not install these model stacks.
+
+\section{Derivation of a proper scoring rule}
+\subsection{From an event score to a distribution score}
+Let $G_x$ be the true conditional CDF of $Y$ given permitted information $X=x$, and let $F_x$ be the forecast CDF. For any threshold $z$, $O_z=\mathbf{1}\{Y\le z\}$ is Bernoulli with probability $G_x(z)$. Its squared probability loss satisfies
+\begin{equation}
+\E[(F_x(z)-O_z)^2\mid X=x]
+=(F_x(z)-G_x(z))^2+G_x(z)(1-G_x(z)).
+\end{equation}
+Integrating over thresholds yields the continuous ranked probability score,
+\begin{equation}
+\CRPS(F_x,y)=\int_{\R}(F_x(z)-\mathbf{1}\{y\le z\})^2\,dz,
+\end{equation}
+and the conditional regret identity
+\begin{equation}
+\E[\CRPS(F_x,Y)\mid x]-\E[\CRPS(G_x,Y)\mid x]
+=\int_{\R}(F_x(z)-G_x(z))^2\,dz\ge0.
+\label{eq:proper}
+\end{equation}
+For distributions with finite first moments, truthful distribution forecasts uniquely minimize expected loss (up to CDF equality), so CRPS is strictly proper. \emph{Smaller} scores are better; a utility-style score can be $-\CRPS$. Extreme financial returns motivate a finite-first-moment score rather than a Gaussian log-score assumption. Data-quality errors still require an audit, not simply a robust metric.
+
+\subsection{A common interface for quantile-producing models}
+With $Q_F(\alpha)$ the forecast quantile and pinball loss $\rho_\alpha(u)=u(\alpha-\mathbf{1}\{u<0\})$,
+\begin{equation}
+\CRPS(F,y)=2\int_0^1\rho_\alpha(y-Q_F(\alpha))\,d\alpha.
+\end{equation}
+For a continuous true CDF, differentiating expected pinball loss with respect to a proposed quantile $q$ gives $G_x(q)-\alpha$, minimized at a true $\alpha$-quantile. Use the common grid $\mathcal A=\{0.05,0.10,\ldots,0.95\}$ and the primary operational score
+\begin{equation}
+L_Q(q,y)=\frac{2}{19}\sum_{\alpha\in\mathcal A}\rho_\alpha(y-q_\alpha).
+\label{eq:quantile}
+\end{equation}
+This is proper for the reported quantile vector; with unique true quantiles its minimizer is unique. It is \emph{not} strictly proper for the entire distribution because finitely many quantiles leave the tails and between-grid behavior unidentified. It approximates the CRPS integral but is labeled \emph{quantile score}, not exact CRPS. Use the same grid for every model, check monotonicity, and preregister any rearrangement. Point-only methods need a separately labeled training/validation-fitted distributional wrapper, or appear only in the MSE comparison. Predictive samples permit exact empirical-distribution CRPS,
+\begin{equation}
+\CRPS(\widehat F_M,y)=\frac1M\sum_{j=1}^M|v_j-y|
+-\frac{1}{2M^2}\sum_{j,k=1}^M|v_j-v_k|.
+\end{equation}
+Finite samples introduce approximation error relative to the latent predictive distribution; use a common sample budget where possible.
+
+\subsection{Aggregation and secondary point score}
+Normalize by $s_i>0$, a per-security training-only return scale with pooled fallback for short histories. Equal-weight the three horizons; report both pooled news-origin results and macro averages over eligible securities. Security eligibility and weights are fixed using training data, not large realized test returns. Fixed positive weights/scales preserve propriety. Use separate news/no-news evaluation if the target population is expanded.
+
+For point forecasts, squared loss is proper for the \emph{conditional mean}, not the whole distribution:
+\begin{equation}
+\E[(Y-a(X))^2]=\E[\Var(Y\mid X)]+\E[(a(X)-\E[Y\mid X])^2].
+\label{eq:mse}
+\end{equation}
+Report MSE using the predictive \emph{mean}, not its median, and
+$R^2_{\mathrm{OS}}=1-\sum(Y-\widehat\mu)^2/\sum Y^2$ versus the zero-return mean baseline. Negative values are valid and important. Report quantile skill $1-\bar L_{Q,\mathrm{model}}/\bar L_{Q,\mathrm{baseline}}$ against the training-only empirical-distribution baseline, plus 50/80/90\% interval coverage. Coverage alone is not a proper score because excessively wide intervals can look calibrated.
+
+\section{What is the best possible score given the features?}
+The assignment's oracle comparison needs three different meanings, not an assertion that knowing historical outcomes reveals $P(Y\mid X)$.
+\begin{enumerate}
+\item \textbf{Population, feature-constrained optimum.} Equation~\eqref{eq:proper} shows $F^*(\cdot\mid X)=G_X$, with
+\begin{equation}
+R^*_{\CRPS}=\E_X\int G_X(z)(1-G_X(z))\,dz
+=\tfrac12\E_X\E[|Y-Y'|\mid X],
+\end{equation}
+where $Y,Y'$ are independent conditional draws. Equation~\eqref{eq:mse} gives $a^*(X)=\E[Y\mid X]$ and $R^*_{\MSE}=\E[\Var(Y\mid X)]$. These risks are generally positive. One realized label per rich feature vector does not identify them. For real RavenPack/TAQ data, estimate attainable performance using cross-fitted flexible reference models and learning curves; do not present that estimate as a proven Bayes floor.
+\item \textbf{Retrospective optimum within a declared feature partition.} Fix a finite grouping $g(X)$ before reading test labels, e.g., training-defined sentiment bins and time-of-day strata. Restrict forecasts to be constant within cells. After outcomes are revealed, the empirical cell CDF minimizes empirical CRPS, cell empirical quantiles minimize $L_Q$, and cell means minimize MSE. This computes an exact empirical optimum \emph{for the restricted feature-cell class}. It is a label-informed diagnostic, not a deployable model or an oracle bound for every rich-feature forecaster. Report cell counts and degeneracy: singleton cells have a zero empirical optimum.
+\item \textbf{Unrestricted outcome-lookup optimum.} Reporting $\delta_y$ and mean $y$ gives score zero on a known record. If every feature vector is unique, an unrestricted lookup function keyed by those vectors can attain zero empirical loss. This is memorization, not feature-based generalization and not a legitimate test predictor. Report it only to expose the ambiguity.
+\end{enumerate}
+The synthetic trial below supplies a known conditional law, so its Bayes risk \emph{can} be calculated. On real data, no exact numerical population optimum is available from the supplied PDF.
+
+\section{Trial protocol and software implementation}
+\subsection{Preregistered real-data trial}
+\begin{enumerate}
+\item \textbf{Pilot sample.} Start with 100 mapped stocks chosen by training-period valid-quote coverage, requiring at least 200 valid training bars per stock. Use the 2010 panel, target all three horizons, and report cleaning and news-origin counts. Expand only after memory and timing are measured; do not choose securities by test performance.
+\item \textbf{Chronological partition.} Select common trading-date boundaries at 60\% and 80\% of the year's sessions, never random rows or separate boundaries per stock. Purge any origin whose label horizon crosses a boundary; impose a three-bar embargo for adjacent labeled origins at each boundary. Keep all stock/origin records together. Scale, encode, calibrate, fit heads, and tune context lengths using train/validation only.
+\item \textbf{Forecast availability.} In the test period, a forecast at $t$ can use observations and news received through $t$, including already realized earlier test-bar returns. This is legitimate rolling forecasting, not test-label training. Freeze task-fitted parameters and hyperparameters at the validation cutoff; only contexts update. Validate future news columns are absent, or masked in interfaces requiring future rows.
+\item \textbf{Model tracks.} In A, every candidate receives identical return histories. In B, direct TabPFN receives observed news, return summaries, and calendar features; Chronos-2/Moirai/TimesFM receive supported historical covariates and only known-future calendar covariates. Train any point-model uncertainty wrapper using training residuals or cross-fitted residuals and calibrate on validation, never test.
+\item \textbf{Budget and comparison.} Test contexts of 26/130/520 bars on validation; a one-session context may be shorter than some model patch sizes, so adapter feasibility is checked first. Use fixed candidate budgets and deterministic seeds where supported. Record latency, memory, missing forecasts, and per-horizon scores. Compare models on the same completed origin set; report failures rather than silently grant favorable subsets.
+\item \textbf{Uncertainty and robustness.} Use paired block bootstrap of trading dates, retaining the entire cross-stock panel in each block, with a preregistered five-session block length and sensitivity analysis. Report uncertainty, not just a leaderboard. Examine sentiment ablations, news intensity, volatility regimes, and liquidity only with training-defined groups. Audited original targets are primary; any winsorized-target analysis is separate and does not have the same estimand.
+\end{enumerate}
+
+\textbf{Pretraining leakage.} A model released in 2026 is not an investable 2010 strategy: its pretraining may include later observations or overlapping public financial series. This is retrospective transfer forecasting with task-time inputs restricted, not a claim of historical deployability. Audit each training corpus when documented, record unresolved overlap, consider synthetic-only pretrained checkpoints as a sensitivity check, and ultimately validate on a genuinely post-release licensed sample. A chronological task split alone does not resolve pretraining contamination.
+
+\subsection{Adapter design and what has actually been built}
+The proposed raw-data implementation streams SAS news chunks into a security/time-indexed intermediate table, joins quotes by dated mapping, constructs a regular market-session grid, and writes model inputs and immutable labels separately. Foundation adapters expose
+\texttt{predict(context, past\_covariates, known\_future, horizons)}
+and return means plus the common 19 quantiles. Direct TabPFN uses one supervised table per horizon with older labeled rows as its in-context training set; only labels realized by the forecast origin are eligible. This is task-data conditioning, even if pretrained weights stay frozen. The off-the-shelf TabPFN-TS wrapper is a separate calendar/history comparator, not a way to sneak unknown future sentiment into the forecast.
+
+\textbf{Implemented now:} \texttt{proposal/trial.py} is a standard-library reference, not an implemented raw-data join or a foundation-model runner. It (i) computes Gaussian CRPS, empirical-distribution CRPS, and the common quantile score; (ii) trains a feature-only linear Gaussian predictor on a chronological synthetic training set; (iii) calibrates its spread on validation; (iv) compares it with a zero-mean baseline, a known Bayes oracle, a retrospective feature-cell oracle, and outcome lookup; and (v) scores exported forecast CSV files with duplicate, finiteness, and quantile-crossing checks.
+
+\textbf{Reproduction from the repository root:}
+\begin{quote}\small\ttfamily
+python3 proposal/trial.py --output trial-results.json\\
+cd proposal\\
+xelatex -interaction=nonstopmode -halt-on-error proposal.tex\\
+xelatex -interaction=nonstopmode -halt-on-error proposal.tex
+\end{quote}
+For real forecast scoring, use
+\texttt{python3 proposal/trial.py --predictions forecasts.csv --scale S},
+where $S$ is a fixed positive pooled training-only scale. Required fields are
+\texttt{series\_id, origin, horizon, target, mean, q05, q10,}\ldots\texttt{, q95}.
+This CLI reports pooled scores by horizon; the planned per-security macro scoring, date-block bootstrap, and foundation adapters are \emph{not yet implemented}. A forecast file must be generated without the target column entering the predictor; the scorer alone cannot certify provenance.
+
+\section{Completed scoring trial and interpretation}
+\subsection{Synthetic, not financial, results}
+To verify the assignment's score/oracle logic without inventing inaccessible data, generate 1,200 ordered artificial origins with observed $X\in\{-1,0,1\}$ and
+\begin{equation}
+Y_h=a_hX+\epsilon_h,\quad
+a=(0.004,0.002,0.001),\quad
+\epsilon_h\sim N(0,\sigma_h^2),\quad
+\sigma=(0.010,0.014,0.018).
+\end{equation}
+Draw $X$ uniformly, independent errors across origins/horizons, with seed 294. The 720/240/240 chronological split mirrors the thesis's proportions, but this artificial task has no market-session overlap and is \emph{not} a realistic financial simulator. Fit OLS intercept and sentiment slope separately for each horizon on training data; fit residual spreads on training data and choose one spread multiplier from $\{0.5,0.75,1,1.25,1.5\}$ on validation CRPS. The selected multiplier is 1.0. No test outcome enters the trained predictor.
+
+The known Bayes distribution is $N(a_hX,\sigma_h^2)$. For this law,
+$R^*_{\MSE,h}=\sigma_h^2$ and $R^*_{\CRPS,h}=\sigma_h/\sqrt{\pi}$.
+Scores below divide CRPS by the horizon's training standard deviation $s_h$ and MSE by $s_h^2$. In the finite-feature diagnostic, cells are exactly the three permitted sentiment values.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& \multicolumn{3}{c}{Normalized MSE} & \multicolumn{3}{c}{Normalized CRPS}\\
+\cmidrule(lr){2-4}\cmidrule(l){5-7}
+Predictor & $h=1$ & $h=2$ & $h=3$ & $h=1$ & $h=2$ & $h=3$\\
+\midrule
+Zero-mean Gaussian & 0.8685 & 1.0329 & 0.8812 & 0.5325 & 0.5697 & 0.5284\\
+Trained linear Gaussian & 0.8064 & 1.0176 & 0.8817 & 0.5134 & 0.5660 & 0.5285\\
+Known Bayes: realized test & 0.8093 & 1.0179 & 0.8690 & 0.5143 & 0.5662 & 0.5250\\
+Cell oracle: retrospective & 0.8021 & 1.0161 & 0.8569 & 0.5104 & 0.5628 & 0.5197\\
+Outcome lookup: invalid & 0 & 0 & 0 & 0 & 0 & 0\\
+\midrule
+Bayes: population expectation & 0.9482 & 1.0629 & 0.9852 & 0.5494 & 0.5817 & 0.5600\\
+\bottomrule
+\end{tabular}
+\caption{Executed reference trial. CRPS here is exact for the reported distribution, not the finite-grid quantile score. Values are synthetic and cannot rank foundation models.}
+\end{table}
+
+The trained predictor improves on the zero-mean baseline at horizons 1 and 2, but not 3. A learned predictor can marginally beat the known Bayes forecast on one realized sample; Bayes optimality is an \emph{expected-risk} statement, not a samplewise inequality. Likewise, realized oracle losses need not equal their population expectations. The retrospective cell oracle uses test labels and cannot be deployed, but gives the exact empirical optimum when predictions must be functions of the three discrete feature values. A richer model cannot remove the independent Gaussian noise; its population improvement is limited to better estimating the true conditional mean/spread. This demonstration validates implementation and reasoning, not transfer to markets.
+
+\subsection{What the thesis establishes, and what remains unknown}
+The thesis's Table 7 reports a two-hidden-layer network with first-future-interval MSE 0.956 and $R^2_{\mathrm{test}}=0.044$, but the best reported second- and third-interval network $R^2$ values remain negative (approximately $-0.045$ and $-0.093$). Table 6's regression-tree test $R^2$ values are also negative. Therefore the broad narrative ``nonlinear models predict better'' does \emph{not} establish useful prediction at every horizon. The tabulated tree MSE/$R^2$ pairs and normalization require reproduction before cross-model numerical comparisons; the neural-network MSE values must not be treated as unscaled raw-return errors.
+
+No foundation-model score on these data is yet available. Improvements are plausible through nonlinear news interactions, pretrained representations, uncertainty calibration, and better data cleaning. They are not guaranteed: weak return autocorrelation, rapid information incorporation, regime shifts, bid--ask effects, and heavy-tailed errors can leave little predictable mean signal. Distributional volatility prediction might improve proper scores even when directional/MSE skill is negligible. A useful negative finding is that generic foundation models fail to outperform a training-only distribution baseline under a fair information set. Transaction costs and executable timing would be required before interpreting predictive skill as profitability.
+
+\section{Assignment coverage and completion criteria}
+\begin{tabularx}{\linewidth}{@{}P{0.35\linewidth}Y@{}}
+\toprule
+Assignment requirement & Coverage / status \\
+\midrule
+Find a source and prediction outcomes & Thesis data inventory and future-return targets; licensed raw data still required.\\
+Identify relevant features & Explicit history/news/calendar information set and availability rules.\\
+Derive a proper score & Threshold-Brier derivation of CRPS; quantile propriety and MSE mean-elicitation proofs.\\
+Set up a trial task & Defined real-data pilot plus an executed synthetic scoring trial.\\
+Find the optimal feature-based score & Analytic Bayes result for the known synthetic law; exact empirical finite-cell oracle; real-data Bayes optimum not identified.\\
+Describe method and implementation & Executed OLS/Gaussian reference and CSV scorer; foundation adapters and raw-data pipeline specified but not built/run.\\
+Compare to optimum; discuss improvement & Synthetic numerical comparison and thesis evidence; honest constraints on real-data conclusions.\\
+\bottomrule
+\end{tabularx}
+
+\textbf{To complete the empirical assignment:} provide authorized raw data/mapping; freeze the cleaned panel and chronological splits; run the baselines and minimal foundation-model shortlist; export paired predictions; score and bootstrap them; replace the proposal's unrun comparisons with observed results. A title such as ``proposal'' should not obscure that the original assignment asks for an implemented, scored prediction method: the synthetic method meets that narrower requirement, whereas the intended RavenPack/TAQ foundation-model study remains pending.
+
+\begin{thebibliography}{99}
+\small
+\bibitem{thesis} Qiuran Lyu. \emph{The Impact of Company News on Stock Returns: Evidence from RavenPack News and TAQ High-Frequency Trading Data} (translated title). Renmin University of China undergraduate thesis, 2023. Supplied PDF; data pp.~5--11 and results pp.~18--20.
+\bibitem{ravenpack} RavenPack. \emph{News Analytics}, official product documentation. \url{https://www.ravenpack.com/products/news-analytics}.
+\bibitem{taq} WRDS. \emph{NYSE Trade and Quote (TAQ)}, data-vendor overview. \url{https://wrds-www.wharton.upenn.edu/pages/about/data-vendors/nyse-trade-and-quote-taq/}.
+\bibitem{tabpfn} Prior Labs. \emph{TabPFN-TS: Zero-Shot Time Series Forecasting with TabPFN}. Paper: \href{https://arxiv.org/abs/2501.02945}{arXiv:2501.02945}; current capabilities/version: \url{https://github.com/PriorLabs/tabpfn-time-series}. Consult the covariate-use table, local/client modes, and September 2026 release notes.
+\bibitem{chronos} Amazon Science. \emph{Chronos: Learning the Language of Time Series}, \href{https://arxiv.org/abs/2403.07815}{arXiv:2403.07815}; \emph{Chronos-2} report, \href{https://arxiv.org/abs/2510.15821}{arXiv:2510.15821}. Current APIs and checkpoints: \url{https://github.com/amazon-science/chronos-forecasting}.
+\bibitem{timesfm} Google Research. \emph{A Decoder-Only Foundation Model for Time-Series Forecasting}, ICML 2024, \href{https://arxiv.org/abs/2310.10688}{arXiv:2310.10688}. Version 3.0 features/licenses: \url{https://github.com/google-research/timesfm}; weights: \url{https://huggingface.co/google/timesfm-3.0-pytorch}. The original paper is not evidence for every 3.0 capability.
+\bibitem{moirai} Salesforce AI Research. \emph{Unified Training of Universal Time Series Forecasting Transformers}, ICML 2024, \href{https://arxiv.org/abs/2402.02592}{arXiv:2402.02592}; \emph{Moirai 2.0: When Less Is More for Time Series Forecasting}, \href{https://arxiv.org/abs/2511.11698}{arXiv:2511.11698}. Library: \url{https://github.com/SalesforceAIResearch/uni2ts}; quantile output/license: \url{https://huggingface.co/Salesforce/moirai-2.0-R-small}. Past-covariate interface: \href{https://github.com/SalesforceAIResearch/uni2ts/blob/main/src/uni2ts/model/moirai2/forecast.py}{\texttt{Moirai2Forecast} source}.
+\bibitem{sundial} Yong Liu et al. \emph{Sundial: A Family of Highly Capable Time Series Foundation Models}, ICML 2025, \href{https://arxiv.org/abs/2502.00816}{arXiv:2502.00816}. Official sample-generation implementation: \url{https://github.com/thuml/Sundial}.
+\bibitem{timer} Yong Liu et al. \emph{Timer: Generative Pre-Trained Transformers Are Large Time Series Models}, ICML 2024, \href{https://arxiv.org/abs/2402.02368}{arXiv:2402.02368}; \emph{Timer-XL}, \href{https://arxiv.org/abs/2410.04803}{arXiv:2410.04803}. Official model/checkpoint inventory: \url{https://github.com/thuml/Large-Time-Series-Model}.
+\bibitem{timemoe} \emph{Time-MoE: Billion-Scale Time Series Foundation Models with Mixture of Experts}, ICLR 2025, \href{https://arxiv.org/abs/2409.16040}{arXiv:2409.16040}. Official code, released sizes, and covariate TODO: \url{https://github.com/Time-MoE/Time-MoE}.
+\bibitem{moment} \emph{MOMENT: A Family of Open Time-Series Foundation Models}. Official forecasting/head-training documentation: \url{https://github.com/moment-timeseries-foundation-model/moment}.
+\bibitem{scoring} Tilmann Gneiting and Adrian E. Raftery. \emph{Strictly Proper Scoring Rules, Prediction, and Estimation}. Journal of the American Statistical Association 102(477):359--378, 2007. \url{https://doi.org/10.1198/016214506000001437}.
+\end{thebibliography}
+\textit{Source policy: model facts are drawn from the cited primary repositories/model cards, accessed September 30, 2026. Checkpoint-specific output interfaces, weight terms, and exact revisions must be rechecked and pinned before empirical execution.}
+\end{document}
